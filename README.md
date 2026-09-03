@@ -1,4 +1,4 @@
-# edupage-mcp
+# edupage-mcp-full
 
 A Model Context Protocol (MCP) server that exposes the full functionality of the
 [`edupage-api`](https://github.com/EdupageAPI/edupage-api) Python library to AI
@@ -7,7 +7,8 @@ agents such as opencode, Claude, Cursor and any other MCP client.
 EduPage is a school information system used across Europe. This server lets you
 query and operate a student / teacher / parent EduPage account directly from
 your agent: timetables, grades, homework, substitutions, meals (including
-ordering), messages, rosters, parent child-switching and more.
+ordering), messages, rosters, parent child-switching and more — including
+**multiple schools** (e.g. two children attending different schools).
 
 > **⚠️ Unofficial API.** Like all EduPage MCP servers, this relies on the
 > community-maintained [`edupage-api`](https://github.com/EdupageAPI/edupage-api)
@@ -83,13 +84,16 @@ env-var credentials) so it slots into your existing setup without surprises.
 
 ## What it provides
 
-A single stdio MCP server (`edupage_mcp.py`) exposing **39 tools**:
+A single stdio MCP server exposing **41 tools** (published on PyPI as
+[`edupage-mcp-full`](https://pypi.org/project/edupage-mcp-full/)):
 
 - **Authentication** — `login`, `login_auto`, `login_all`, `login_from_session`,
   `two_factor_check_confirmed`, `two_factor_finish`, `auth_status`, `user_id`
 - **Timetables** — `get_my_timetable`, `get_timetable` (teacher/student/class/
-  classroom), `get_next_week_timetable`, `get_next_ringing_time`, `get_periods`,
-  `school_year`
+  classroom), `get_child_timetable` (child by name), `get_next_week_timetable`,
+  `get_next_ringing_time`, `get_periods`, `school_year`
+- **Children** — `get_child_id` (name → person_id lookup), `get_child_timetable`,
+  `switch_to_child` (by id **or** name), `switch_to_parent`
 - **Grades** — `get_grades`
 - **Notifications / timeline** — `get_notifications`, `get_notification_history`,
   `get_homework`, `get_assignments`, `get_absences`, `get_upcoming_events`, `get_news`
@@ -111,19 +115,38 @@ A single stdio MCP server (`edupage_mcp.py`) exposing **39 tools**:
 
 ### 1. Install
 
+**Option A — from PyPI (recommended):**
+
+```bash
+uvx edupage-mcp-full
+# or, if you prefer pip (into whatever environment your MCP client uses):
+pip install edupage-mcp-full
+```
+
+`uvx` runs the package **without** installing it — this is the canonical way MCP
+servers are launched. `uv` is required for `uvx` (install with
+`pip install uv` or `winget install astral-sh.uv`).
+
+**Option B — from GitHub (latest source):**
+
+```bash
+uvx --from "git+https://github.com/oliverhruby/edupage-mcp.git" edupage-mcp-full
+# or
+pip install "git+https://github.com/oliverhruby/edupage-mcp.git"
+```
+
+**Option C — development from source:**
+
 ```bash
 git clone https://github.com/oliverhruby/edupage-mcp.git
 cd edupage-mcp
-python -m venv .venv
-# Windows
-.venv\Scripts\python -m pip install -r requirements.txt
-# macOS / Linux
-.venv/bin/python -m pip install -r requirements.txt
+uv sync               # or: python -m venv .venv && .venv/bin/python -m pip install -e .
+uv run edupage-mcp-full
 ```
 
-> `requirements.txt` pins `mcp<2` (the stable FastMCP v1 API). `mcp 2.x`
-> renamed `FastMCP` to `MCPServer` and changed the API surface; this server
-> targets the FastMCP v1 API for simplicity and stability.
+> `pyproject.toml` pins `mcp<2` (the stable FastMCP v1 API). `mcp 2.x` renamed
+> `FastMCP` to `MCPServer` and changed the API surface; this server targets the
+> FastMCP v1 API for simplicity and stability.
 
 ### 2. Configure credentials
 
@@ -155,10 +178,7 @@ export EDUPAGE_SUBDOMAIN="your_school"
     "edupage": {
       "type": "local",
       "enabled": true,
-      "command": [
-        "C:/Users/YOU/dev/edupage-mcp/.venv/Scripts/python.exe",
-        "C:/Users/YOU/dev/edupage-mcp/edupage_mcp.py"
-      ],
+      "command": ["uvx", "edupage-mcp-full"],
       "env": {
         "EDUPAGE_USERNAME": "{env:EDUPAGE_USERNAME}",
         "EDUPAGE_PASSWORD": "{env:EDUPAGE_PASSWORD}",
@@ -168,6 +188,10 @@ export EDUPAGE_SUBDOMAIN="your_school"
   }
 }
 ```
+
+> Put credentials in your shell/environment (or a `.env`) and reference them with
+> `{env:VAR}`, or hardcode them under `env:` directly. `uvx` will auto-provision
+> the package the first time; it must be on your `PATH`.
 
 **Claude Desktop / Cursor** — use `claude_desktop_config.json` /
 `.mcp.json` with a `mcpServers` entry in the standard shape, pointing
@@ -220,6 +244,13 @@ get_my_children
 switch_to_child child_id=123
 get_my_timetable
 switch_to_parent
+
+# Children by NAME, in their own school — e.g. "timetable for Viktor" / "for Tamara"
+# (both children attend DIFFERENT schools, so each call names its subdomain)
+get_child_id name="Viktor" subdomain="zsskola1"
+get_child_timetable name="Viktor" subdomain="zsskola1"
+get_child_timetable name="Viktor" date_str="2026-09-10" subdomain="zsskola1"
+get_child_timetable name="Tamara" subdomain="zsskola2"
 ```
 
 ---
@@ -245,6 +276,39 @@ You can also call `login` once per school to add/lookup sessions incrementally.
 
 ---
 
+## Children by name (e.g. "timetable for Viktor")
+
+If you have **two children at different schools**, those are two different
+subdomains. There is no automatic way for the server to know which first name
+maps to which school — the name → school mapping lives with **you** (your agent /
+personal instructions), not in the server. So "timetable for Viktor" needs one
+extra bit of information from you the first time: which school Viktor is in.
+
+Use a per-child template like:
+
+```text
+# my children's schools (keep this wherever your personal notes live)
+Viktor -> zsskola1
+Tamara -> zsskola2
+
+# then, to ask for a timetable:
+"timetable for Viktor"  ->  get_child_timetable name="Viktor" subdomain="zsskola1"
+"timetable for Tamara"  ->  get_child_timetable name="Tamara" subdomain="zsskola2"
+```
+
+`get_child_timetable`:
+
+1. looks up the student by first/last/full name inside the given subdomain
+   (`get_child_id` does just this lookup),
+2. switches to the child account if you're logged in as a parent,
+3. returns that child's timetable for the date, and
+4. switches back to the parent account afterwards.
+
+So once the agent knows the school for each child, "timetable for Viktor" is a
+single unambiguous tool call.
+
+---
+
 ## Tool reference
 
 | Tool | Description | Writes? |
@@ -260,6 +324,7 @@ You can also call `login` once per school to add/lookup sessions incrementally.
 | `school_year` | Current school year |  |
 | `get_my_timetable` | Logged-in user's timetable for a date |  |
 | `get_timetable` | Timetable of a teacher/student/class/classroom |  |
+| `get_child_timetable` | A child's timetable by name or id (auto switch to/from child) | ✅ session |
 | `get_next_week_timetable` | Mon–Fri timetable for next week |  |
 | `get_next_ringing_time` | Next bell (break/lesson) at a given time |  |
 | `get_periods` | Bell schedule (period start/end times) |  |
@@ -284,8 +349,9 @@ You can also call `login` once per school to add/lookup sessions incrementally.
 | `get_classrooms` | All classrooms |  |
 | `get_subjects` | All subjects |  |
 | `get_my_children` | Parent's children / student's classmates |  |
+| `get_child_id` | Look up a student's person_id by name |  |
 | `send_message` | Send a message to a user | ✅ |
-| `switch_to_child` | Switch to a child account (parent only) | ✅ session |
+| `switch_to_child` | Switch to a child account by id or name (parent only) | ✅ session |
 | `switch_to_parent` | Switch back to the parent account | ✅ session |
 | `custom_request` | Raw request through the active session (GET/POST) | ✅ |
 
@@ -313,7 +379,7 @@ You can also call `login` once per school to add/lookup sessions incrementally.
 MCP client (opencode / Claude / Cursor ...)
         │  stdio JSON-RPC
         ▼
-edupage_mcp.py  (FastMCP server, mcp<2)
+edupage-mcp-full  (FastMCP server, mcp<2, console entry point edupage-mcp-full)
         │  thin, stateless-per-tool facade
         ▼
 edupage-api  (community library, all the EduPage endpoint work)
@@ -331,8 +397,10 @@ serialise its data model, and make multi-school + write operations ergonomic.
 
 | File | Role |
 |---|---|
-| `edupage_mcp.py` | The entire MCP server (single file, stdio transport). |
-| `requirements.txt` | Pinned deps: `mcp<2` and `edupage-api>=0.12.3`. |
+| `src/edupage_mcp/__init__.py` | The entire MCP server (all 41 tools + `main()`). |
+| `src/edupage_mcp/__main__.py` | Enables running as `python -m edupage_mcp`. |
+| `pyproject.toml` | Package metadata + `edupage-mcp-full` console entry point. |
+| `requirements.txt` | Dev install (`-e .`). |
 
 ### Session & state management
 
@@ -396,11 +464,12 @@ Each tool runs through `_run(..., error_label)`, which:
    includes the exception type and message, so the agent can tell the user what
    went wrong instead of crashing.
 
-### Dependency isolation (optional but recommended)
+### Dependency isolation
 
-The server uses Python-only deps. To avoid clashing with an unrelated global
-`mcp` install (e.g. a newer v2.x), it is recommended to run it from its own
-virtualenv pinned to `mcp<2` — see [Install](#1-install).
+The server uses Python-only deps and is pinned to `mcp<2`. Both `uvx` and the
+`pip install -e .` dev path keep the package isolated from any unrelated global
+`mcp` (e.g. a newer v2.x) install, because each runs in its own environment —
+see [Install](#1-install).
 
 ---
 
@@ -415,6 +484,9 @@ virtualenv pinned to `mcp<2` — see [Install](#1-install).
   methods are best-effort.
 - The auth session lives for the lifetime of the MCP server process; restarting
   the client means logging in again.
+- **Children at different schools** require you to tell the agent which subdomain
+  each child is in (the server can't guess it). See
+  [Children by name](#children-by-name-eg-timetable-for-viktor).
 
 ---
 

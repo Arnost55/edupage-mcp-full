@@ -369,6 +369,61 @@ def _resolve_target(client, target_type, target_id):
     raise RuntimeError("target_type must be teacher, student, class or classroom.")
 
 
+def _find_child(client, name: str):
+    """Find a student by first/last/full name (case-insensitive) within a school."""
+    needle = str(name).strip().lower()
+    if not needle:
+        raise RuntimeError("name must be provided.")
+    candidates = []
+    for s in (client.get_all_students() or []) + (client.get_students() or []):
+        sname = getattr(s, "name", "") or ""
+        parts = [p.strip().lower() for p in sname.split(",") if p.strip()]
+        names = parts + sname.split()
+        match = any(p == needle for p in names) or (needle in sname.lower())
+        if match:
+            candidates.append(s)
+    if not candidates:
+        raise RuntimeError(f"No student named '{name}' found in this school.")
+    return candidates[0]
+
+
+@_tool
+def get_child_timetable(name: str = None, child_id: str = None, date_str: str = None, subdomain: str = None) -> dict:
+    """Get a child's timetable by first/last name OR person_id within a subdomain.
+    If logged in as a parent, this switches to (and back from) the child account for
+    the lookup. Provide `name` (e.g. 'Viktor' / 'Tamara') or `child_id` (person_id).
+    Returns the child's lessons plus which child/account was used."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        sub = _resolve_subdomain(subdomain)
+        if not name and not child_id:
+            raise RuntimeError("Provide `name` or `child_id` for the child.")
+        if child_id and not name:
+            sid = str(child_id)
+            match = next((s for s in (client.get_all_students() or []) + (client.get_students() or [])
+                          if str(getattr(s, "person_id", "")) == sid), None)
+            if match is None:
+                raise RuntimeError(f"No child with person_id {child_id} found.")
+            name = match.name
+        child = _find_child(client, name)
+        cid = int(child.person_id)
+        user_id = client.get_user_id() or ""
+        was_parent = "Rodic" in user_id
+        if was_parent:
+            client.switch_to_child(cid)
+        try:
+            tt = client.get_my_timetable(d)
+            lessons = [_serialize(ls) for ls in tt.lessons] if tt else []
+        finally:
+            if was_parent:
+                client.switch_to_parent()
+        return {"child": child.name, "child_id": cid, "class_id": getattr(child, "class_id", None),
+                "date": d.isoformat(), "subdomain": sub, "lessons": lessons}
+
+    return _run(go, "get_child_timetable")
+
+
 @_tool
 def get_timetable(target_type: str, target_id: str, date_str: str = None, subdomain: str = None) -> dict:
     """Get the timetable for a teacher, student, class or classroom on a date.
@@ -786,14 +841,31 @@ def get_my_children(subdomain: str = None) -> dict:
 
 
 @_tool
-def switch_to_child(child_id: str, subdomain: str = None) -> dict:
-    """Switch to a child account (parent accounts only). child_id is the child's person_id."""
+def switch_to_child(child_id: str = None, name: str = None, subdomain: str = None) -> dict:
+    """Switch to a child account (parent accounts only). Provide `child_id` (person_id)
+    or `name` (first/last/full name)."""
     def go():
         client = _require_client(subdomain)
-        client.switch_to_child(int(child_id))
-        return {"switched_to_child": int(child_id), "user_id": client.get_user_id()}
+        if not child_id and not name:
+            raise RuntimeError("Provide `child_id` or `name`.")
+        cid = int(child_id) if child_id else int(_find_child(client, name).person_id)
+        client.switch_to_child(cid)
+        return {"switched_to_child": cid, "user_id": client.get_user_id()}
 
     return _run(go, "switch_to_child")
+
+
+@_tool
+def get_child_id(name: str, subdomain: str = None) -> dict:
+    """Look up a student's person_id by first/last name within a subdomain."""
+    def go():
+        client = _require_client(subdomain)
+        child = _find_child(client, name)
+        return {"name": child.name, "child_id": child.person_id,
+                "class_id": getattr(child, "class_id", None),
+                "subdomain": _resolve_subdomain(subdomain)}
+
+    return _run(go, "get_child_id")
 
 
 @_tool

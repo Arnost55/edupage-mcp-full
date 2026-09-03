@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edupage-mcp-full"
+version = "0.1.0"
+description = "Full-feature EduPage MCP server: timetables, grades, homework, meals (ordering), messages, parent child-switching, 2FA, and multiple-school support."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Oliver Hrubý" }]
+requires-python = ">=3.10"
+keywords = ["mcp", "edupage", "education", "ai", "agent", "school", "timetable"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp<2",
+    "edupage-api>=0.12.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/oliverhruby/edupage-mcp"
+Repository = "https://github.com/oliverhruby/edupage-mcp"
+Issues = "https://github.com/oliverhruby/edupage-mcp/issues"
+
+[project.scripts]
+edupage-mcp-full = "edupage_mcp:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

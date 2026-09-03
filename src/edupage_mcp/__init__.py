@@ -46,10 +46,11 @@ EDUPAGE_PASSWORD = os.environ.get("EDUPAGE_PASSWORD", "")
 EDUPAGE_SUBDOMAINS = os.environ.get("EDUPAGE_SUBDOMAINS", "")
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+port_str = os.environ.get("MCP_PORT", "8000")
 try:
-    MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+    MCP_PORT = int(port_str)
 except ValueError:
-    MCP_PORT = 8000
+    raise SystemExit(f"Error: MCP_PORT must be an integer (got {port_str!r}).")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 
 # Multiple-school support: one Edupage() session per subdomain.

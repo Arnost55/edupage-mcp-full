@@ -59,49 +59,60 @@ This project deliberately goes further:
 | Meals — **read menu** | ✅ | ✅ | ✅ |
 | Meals — **choose / sign-off / rate** | ❌ | ❌ | ✅ |
 | Send messages (`send_message`) | ✅ | ❌ | ✅ |
-| Parent **child switching** (switch to/from child) | partial (list) | ❌ | ✅ |
+| Parent **student switching** (switch to/from student) | partial (list) | ❌ | ✅ |
 | **2FA** login flow (device + email code) | ❌ | ❌ | ✅ |
 | Login via **session id** (`PHPSESSID`) | ❌ | ❌ | ✅ |
 | Portal login (`login_auto`) | ✅ | ❌ | ✅ |
 | Next ringing time / bell schedule | ❌ | ❌ | ✅ |
 | Raw session **custom request** | ❌ | ❌ | ✅ |
 | **Multiple schools** in one session | ❌ | ❌ | ✅ |
+| **Automatic multi-school login** (env-based) | ❌ | ❌ | ✅ |
+| **Cross-school student discovery** (no mapping needed) | ❌ | ❌ | ✅ |
+| **Role-aware** (parent / student / teacher) | ❌ | ❌ | ✅ |
+| **OIDC trusted publishing** (no PyPI token) | ❌ | ❌ | ✅ |
 
-In short:
+**Key differentiators:**
 
-- **For read-only use** (timetables, grades, notifications) this project is on
-  par with the others, and it reuses the same underlying `edupage-api` library,
-  so data reliability is identical.
-- **For the full feature set** — writing messages, ordering meals, parent
-  child-switching, 2FA, session-id login, multi-school — only this project
-  covers everything the `edupage-api` actually exposes.
-
-It is also designed to be **opencode-first**: it follows the same conventions
-as your other local MCP servers (stdio transport, JSON text output, `auth_status`,
-env-var credentials) so it slots into your existing setup without surprises.
+- **Multi-school automatic discovery.** Set `EDUPAGE_SUBDOMAINS` with one shared
+  login and the server auto-discovers students across all schools — no need to
+  maintain a manual "Viktor → school A, Tamara → school B" mapping. A student at
+  two schools (e.g. Tamara at `iprskola` + `cvcmalacky`) is found automatically
+  with separate per-school results.
+- **Role-aware tools.** The server detects whether you're a parent, student, or
+  teacher at each school and behaves accordingly — `get_student_timetable`
+  switches to the student account for parents, returns direct timetables for
+  students. No tool duplication.
+- **Full write surface.** Meal ordering/rating, message sending, student switching
+  — the other servers don't cover these.
+- **OIDC publishing.** No PyPI token to manage. Push a tag and GitHub Actions
+  publishes via OIDC trusted publishing.
 
 ---
 
 ## What it provides
 
-A single stdio MCP server exposing **41 tools** (published on PyPI as
+A single stdio MCP server exposing **43 tools** (published on PyPI as
 [`edupage-mcp-full`](https://pypi.org/project/edupage-mcp-full/)):
 
 - **Authentication** — `login`, `login_auto`, `login_all`, `login_from_session`,
   `two_factor_check_confirmed`, `two_factor_finish`, `auth_status`, `user_id`
 - **Timetables** — `get_my_timetable`, `get_timetable` (teacher/student/class/
-  classroom), `get_child_timetable` (child by name), `get_next_week_timetable`,
-  `get_next_ringing_time`, `get_periods`, `school_year`
-- **Children** — `get_child_id` (name → person_id lookup), `get_child_timetable`,
-  `switch_to_child` (by id **or** name), `switch_to_parent`
+  classroom), `get_student_timetable` (student by name, cross-school),
+  `get_next_week_timetable`, `get_next_ringing_time`, `get_periods`, `school_year`
+- **Students** — `find_student` (name → person_id, cross-school),
+  `get_student_timetable` (cross-school, role-aware), `scan_students`
+  (auto-discover all students across schools), `get_my_students` (classmates or
+  school-wide for parents), `switch_to_student` (by id **or** name, parent only),
+  `switch_to_parent`
+- **Schools** — `get_schools` (logged-in schools with role per school)
 - **Grades** — `get_grades`
 - **Notifications / timeline** — `get_notifications`, `get_notification_history`,
   `get_homework`, `get_assignments`, `get_absences`, `get_upcoming_events`, `get_news`
 - **Substitutions** — `get_timetable_changes`, `get_missing_teachers`
 - **Meals** — `get_meals`, `choose_meal`, `sign_off_meal`, `rate_meal`
 - **Rosters** — `get_students`, `get_all_students`, `get_teachers`, `get_classes`,
-  `get_classrooms`, `get_subjects`, `get_my_children`
-- **Actions** — `send_message`, `switch_to_child`, `switch_to_parent`, `custom_request`
+  `get_classrooms`, `get_subjects`, `get_my_students`
+- **Actions** — `send_message`, `switch_to_student`, `switch_to_parent`, `custom_request`
 
 ---
 
@@ -165,16 +176,19 @@ Either set environment variables **or** pass credentials to `login` (see
 # Windows (persistent, per-user)
 setx EDUPAGE_USERNAME "your_username"
 setx EDUPAGE_PASSWORD "your_password"
-setx EDUPAGE_SUBDOMAIN "your_school"   # https://your_school.edupage.org
+setx EDUPAGE_SUBDOMAIN "your_school"     # single school: https://your_school.edupage.org
+setx EDUPAGE_SUBDOMAINS "s1,s2,s3"       # multiple schools: auto-login + child discovery
 
 # macOS / Linux
 export EDUPAGE_USERNAME="your_username"
 export EDUPAGE_PASSWORD="your_password"
 export EDUPAGE_SUBDOMAIN="your_school"
+export EDUPAGE_SUBDOMAINS="s1,s2,s3"
 ```
 
-`EDUPAGE_SUBDOMAIN` is the single-subdomain case. For **multiple schools** see
-[Multiple schools](#multiple-schools-subdomains).
+`EDUPAGE_SUBDOMAIN` is the single-subdomain case; for **multiple schools** use
+`EDUPAGE_SUBDOMAINS` (auto-login on startup + automatic child discovery). See
+[Multiple schools & automatic child discovery](#multiple-schools--automatic-child-discovery).
 
 ### 3. Register with your MCP client
 
@@ -247,73 +261,89 @@ choose_meal date_str="2026-09-10" meal_type="lunch" number=2
 get_teachers
 send_message recipient_id="Teacher456" body="Hello!"
 
-# Parent account: see children, then switch to one
-get_my_children
-switch_to_child child_id=123
+# Parent account: see students, then switch to one
+get_my_students
+switch_to_student student_id=123
 get_my_timetable
 switch_to_parent
 
-# Children by NAME, in their own school — e.g. "timetable for Viktor" / "for Tamara"
-# (both children attend DIFFERENT schools, so each call names its subdomain)
-get_child_id name="Viktor" subdomain="zsskola1"
-get_child_timetable name="Viktor" subdomain="zsskola1"
-get_child_timetable name="Viktor" date_str="2026-09-10" subdomain="zsskola1"
-get_child_timetable name="Tamara" subdomain="zsskola2"
+# Students by NAME — auto-discovered across all logged-in schools
+# (works even when Viktor and Tamara are at different schools / Tamara at two)
+find_student name="Viktor"
+get_student_timetable name="Viktor"
+get_student_timetable name="Viktor" date_str="2026-09-10"
+get_student_timetable name="Tamara"   # returns one result per school where found
+scan_students                         # list every student at every school
 ```
 
 ---
 
-## Multiple schools (subdomains)
+## Multiple schools & automatic student discovery
 
-Each subdomain (school) keeps its **own** logged-in session. Use `login_all`
-to authenticate several schools at once, then pass `subdomain` to any data tool
-(it defaults to the last active subdomain when omitted):
+Each subdomain (school) keeps its **own** logged-in session. There are two ways
+to log in to several schools at once:
+
+**A) Automatic on startup (recommended).** Set `EDUPAGE_SUBDOMAINS` (a
+comma-separated list) plus the shared `EDUPAGE_USERNAME` / `EDUPAGE_PASSWORD` —
+the server logs into all of them when it launches, so every tool is immediately
+ready and students are discoverable across all schools with **no login call and
+no student→school mapping**:
+
+```bash
+setx EDUPAGE_SUBDOMAINS "zssturovamalacky,iprskola,cvcmalacky"   # Windows
+export EDUPAGE_SUBDOMAINS="zssturovamalacky,iprskola,cvcmalacky" # macOS / Linux
+```
 
 ```text
-login_all subdomains="zsskola1,zsskola2" usernames="u1,u2" passwords="p1,p2"
+get_schools        # lists zssturovamalacky, iprskola, cvcmalacky (logged in, with role)
+scan_students      # discovers Viktor and Tamara across those schools
+get_student_timetable name="Tamara"   # is found at iprskola AND cvcmalacky
+```
 
-get_my_timetable subdomain="zsskola1"
-get_my_timetable subdomain="zsskola2"
+**B) On demand with `login_all`.** Authenticate several schools at once, then pass
+`subdomain` to any data tool (it defaults to the last active subdomain when
+omitted):
+
+```text
+login_all subdomains="zssturovamalacky,iprskola" usernames="u1,u2" passwords="p1,p2"
+
+get_my_timetable subdomain="zssturovamalacky"
+get_my_timetable subdomain="iprskola"
 auth_status          # shows all logged-in subdomains + which is active
 ```
 
 You can also call `login` once per school to add/lookup sessions incrementally.
 
-> `EDUPAGE_SUBDOMAIN` env var covers a single school only. For two or more
-> schools use `login_all` or repeated `login` calls.
+> `EDUPAGE_SUBDOMAIN` (singular) env var covers a single school only. For two or
+> more schools use `EDUPAGE_SUBDOMAINS` (auto-login) or `login_all` / repeated
+> `login` calls.
 
 ---
 
-## Children by name (e.g. "timetable for Viktor")
+## Students by name (e.g. "timetable for Viktor")
 
-If you have **two children at different schools**, those are two different
-subdomains. There is no automatic way for the server to know which first name
-maps to which school — the name → school mapping lives with **you** (your agent /
-personal instructions), not in the server. So "timetable for Viktor" needs one
-extra bit of information from you the first time: which school Viktor is in.
-
-Use a per-child template like:
+Because the server **auto-discovers students across all logged-in schools**, you
+don't need to know or state which school a student is in. Just ask for the
+timetable by name and the server searches every school it's logged into:
 
 ```text
-# my children's schools (keep this wherever your personal notes live)
-Viktor -> zsskola1
-Tamara -> zsskola2
-
-# then, to ask for a timetable:
-"timetable for Viktor"  ->  get_child_timetable name="Viktor" subdomain="zsskola1"
-"timetable for Tamara"  ->  get_child_timetable name="Tamara" subdomain="zsskola2"
+"timetable for Viktor"  ->  get_student_timetable name="Viktor"
 ```
 
-`get_child_timetable`:
+`get_student_timetable` (with no `subdomain`):
 
-1. looks up the student by first/last/full name inside the given subdomain
-   (`get_child_id` does just this lookup),
-2. switches to the child account if you're logged in as a parent,
-3. returns that child's timetable for the date, and
-4. switches back to the parent account afterwards.
+1. searches **every logged-in school** for a student whose first/last/full name
+   matches (`scan_students` does just the discovery step),
+2. for each school where the student is found, switches to the student account if
+   you're logged in as a parent, returns that student's timetable for the date, and
+   switches back to the parent account afterwards,
+3. returns **one result per school**.
 
-So once the agent knows the school for each child, "timetable for Viktor" is a
-single unambiguous tool call.
+A student attending **more than one school** (e.g. Tamara at `iprskola` +
+`cvcmalacky`) therefore yields a list of two per-school timetables — separate
+results, never merged. This is the built-in replacement for maintaining a
+manual "Viktor → zsskola1" mapping: with `EDUPAGE_SUBDOMAINS` set, discovery is
+fully automatic.
 
 ---
 
@@ -332,7 +362,7 @@ single unambiguous tool call.
 | `school_year` | Current school year |  |
 | `get_my_timetable` | Logged-in user's timetable for a date |  |
 | `get_timetable` | Timetable of a teacher/student/class/classroom |  |
-| `get_child_timetable` | A child's timetable by name or id (auto switch to/from child) | ✅ session |
+| `get_student_timetable` | Student's timetable by name or id (role-aware, cross-school) | ✅ session |
 | `get_next_week_timetable` | Mon–Fri timetable for next week |  |
 | `get_next_ringing_time` | Next bell (break/lesson) at a given time |  |
 | `get_periods` | Bell schedule (period start/end times) |  |
@@ -356,10 +386,12 @@ single unambiguous tool call.
 | `get_classes` | All classes |  |
 | `get_classrooms` | All classrooms |  |
 | `get_subjects` | All subjects |  |
-| `get_my_children` | Parent's children / student's classmates |  |
-| `get_child_id` | Look up a student's person_id by name |  |
+| `get_my_students` | Students visible to the logged-in account (one school) |  |
+| `find_student` | Look up a student's person_id by name (cross-school) |  |
+| `scan_students` | Auto-discover students across **all** logged-in schools |  |
+| `get_schools` | List logged-in schools + role per school |  |
 | `send_message` | Send a message to a user | ✅ |
-| `switch_to_child` | Switch to a child account by id or name (parent only) | ✅ session |
+| `switch_to_student` | Switch to a student account by id or name (parent only) | ✅ session |
 | `switch_to_parent` | Switch back to the parent account | ✅ session |
 | `custom_request` | Raw request through the active session (GET/POST) | ✅ |
 
@@ -405,7 +437,7 @@ serialise its data model, and make multi-school + write operations ergonomic.
 
 | File | Role |
 |---|---|
-| `src/edupage_mcp/__init__.py` | The entire MCP server (all 41 tools + `main()`). |
+| `src/edupage_mcp/__init__.py` | The entire MCP server (all 43 tools + `main()`). |
 | `src/edupage_mcp/__main__.py` | Enables running as `python -m edupage_mcp`. |
 | `pyproject.toml` | Package metadata + `edupage-mcp-full` console entry point. |
 | `requirements.txt` | Dev install (`-e .`). |

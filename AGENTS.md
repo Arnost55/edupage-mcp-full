@@ -45,7 +45,7 @@ logic. Do not grow a scraping layer here.
     callable for tests.
   - `_run` wraps exceptions → returns `{"isError": True, ...}` (JSON-RPC result).
   - Sub-tools that need parsing helpers should reuse `_serialize`, `_parse_date`,
-    `_resolve_target`, `_find_child` rather than reimplementing.
+    `_resolve_target`, `_find_student` rather than reimplementing.
 - **Read-only vs write.** `get_*` tools read only. Tools that send messages,
   order meals, or switch accounts write — say so in the docstring, and mark in
   the README tool table.
@@ -54,9 +54,12 @@ logic. Do not grow a scraping layer here.
   _clients = {}          # subdomain -> Edupage
   _two_factor = {}       # subdomain -> TwoFactorLogin
   _active_subdomain = None
+  _roles = {}            # subdomain -> "student" | "parent" | "teacher"
   ```
   Every data tool takes an optional `subdomain` and resolves through
-  `_require_client(subdomain)` (falls back to `_active_subdomain`).
+  `_require_client(subdomain)` (falls back to `_active_subdomain`). Role-aware
+  tools use `_roles[sub]` to determine account type and behave accordingly
+  (e.g. parent → switch to student account; student → direct timetable).
 - **JSON output.** Return plain JSON serialisable via `_serialize` (handles
   dataclasses, enums, `datetime`). Don't return raw `edupage-api` objects.
 

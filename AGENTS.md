@@ -81,9 +81,22 @@ There is no test suite; a manual MCP `tools/list` after any addition is the
 verification step. After adding/renaming a tool, update the README "Tool
 reference" table and the tool count in the "What it provides" blurb.
 
-## After changing this repo
+## Publishing (PyPI)
 
-- Bump `version` in `pyproject.toml` before publishing to PyPI.
-- Rebuild + publish with `uv build` / `uv publish` (or `python -m build` +
-  `twine upload`).
-- Keep the README accurate (install, tools, counts).
+Publishing uses **OIDC trusted publishing** via GitHub Actions — no API token.
+See comments at the top of `.github/workflows/publish.yml` for the one-time PyPI
+registration (project `edupage-mcp-full`, workflow name `publish.yml`).
+
+To release a new version:
+
+1. Bump `version` in `pyproject.toml`.
+2. Commit + push.
+3. Push a tag matching the version, e.g. `git tag v0.1.0 && git push --tags`.
+4. The `publish` workflow builds and uploads automatically (uses the `release`
+   GitHub environment, if configured).
+
+> If the `release` environment has a "required reviewers" gate, approve the run
+> in the GitHub Actions UI. Local rebuilds (`python -m build` + `twine upload`)
+> still work as a non-OIDC fallback.
+
+Keep the README accurate (install, tools, counts).

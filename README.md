@@ -148,6 +148,14 @@ uv run edupage-mcp-full
 > `FastMCP` to `MCPServer` and changed the API surface; this server targets the
 > FastMCP v1 API for simplicity and stability.
 
+#### Releases
+
+New versions are published to PyPI automatically via GitHub Actions using
+**OpenID Connect trusted publishing** (no manual token). Pushing a tag such as
+`v0.1.0` triggers the `publish` workflow (see `.github/workflows/publish.yml`
+for the one-time PyPI registration). `version` in `pyproject.toml` must match
+the tag.
+
 ### 2. Configure credentials
 
 Either set environment variables **or** pass credentials to `login` (see

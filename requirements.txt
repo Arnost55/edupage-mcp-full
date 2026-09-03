@@ -1,0 +1,6 @@
+# edupage-mcp requires Python 3.9+
+#
+# Pin mcp to the 1.x line (FastMCP API). mcp 2.x renamed FastMCP -> MCPServer
+# and changed the API surface; this server targets the stable FastMCP v1 API.
+mcp<2
+edupage-api>=0.12.3

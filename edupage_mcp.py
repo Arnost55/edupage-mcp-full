@@ -1,0 +1,834 @@
+"""edupage MCP server.
+
+Exposes the full feature set of the `edupage-api` Python library as MCP tools:
+login (standard, auto, session-id, 2FA), timetables, school year, ringing,
+grades, notifications/history (homework, exams...), substitutions, missing
+teachers, meals (+ ordering), rosters (students/teachers/classes/classrooms/
+subjects), messages, parent child-switching, and custom requests.
+
+Careful: login/send_message/switch_to_child/meal actions mutate Edupage state.
+All `get_*` tools are read-only.
+"""
+
+import builtins
+import datetime as _dt
+import json
+import os
+import sys
+from dataclasses import fields, is_dataclass
+from datetime import date, datetime, time
+from enum import Enum
+from types import SimpleNamespace
+
+from edupage_api import Edupage
+from edupage_api import exceptions as edupage_exceptions
+from edupage_api.classes import Class
+from edupage_api.classrooms import Classroom
+from edupage_api.grades import EduGrade, Term
+from edupage_api.lunches import Meal, MealType, Menu, Meals, Rating
+from edupage_api.people import EduAccount, EduParent, EduStudent, EduStudentSkeleton, EduTeacher
+from edupage_api.ringing import RingingTime, RingingType
+from edupage_api.subjects import Subject
+from edupage_api.substitution import Action, TimetableChange
+from edupage_api.timeline import EventType, TimelineEvent
+from edupage_api.timetables import Lesson, Timetable
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception:
+    FastMCP = None
+
+EDUPAGE_USERNAME = os.environ.get("EDUPAGE_USERNAME", "")
+EDUPAGE_PASSWORD = os.environ.get("EDUPAGE_PASSWORD", "")
+EDUPAGE_SUBDOMAIN = os.environ.get("EDUPAGE_SUBDOMAIN", "")
+
+# Multiple-school support: one Edupage() session per subdomain.
+_clients = {}          # subdomain -> Edupage
+_two_factor = {}       # subdomain -> TwoFactorLogin
+_active_subdomain = None
+
+
+def fail(message: str) -> dict:
+    return {"isError": True, "content": [{"type": "text", "text": message}]}
+
+
+def _resolve_subdomain(subdomain=None):
+    if subdomain:
+        return subdomain
+    return _active_subdomain
+
+
+def _require_client(subdomain=None):
+    sub = _resolve_subdomain(subdomain)
+    client = _clients.get(sub) if sub else None
+    if client is None or not client.is_logged_in:
+        raise RuntimeError(
+            f"Not logged in for subdomain '{sub}'. Call `login` (or `login_all` for "
+            "multiple schools) with that subdomain first."
+        )
+    return client
+
+
+def _humanize(value):
+    if isinstance(value, Enum):
+        return value.value
+    if value is None:
+        return None
+    return str(value)
+
+
+def _serialize(obj):
+    """Convert edupage-api objects (dataclasses, enums, times, dicts) to plain data."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, dict):
+        return {str(k): _serialize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_serialize(v) for v in obj]
+    if is_dataclass(obj):
+        out = {}
+        for f in fields(obj):
+            if f.name.startswith("__"):
+                continue
+            out[f.name] = _serialize(getattr(obj, f.name))
+        return out
+    if hasattr(obj, "__dict__"):
+        out = {}
+        for k, v in vars(obj).items():
+            if k.startswith("_"):
+                continue
+            out[k] = _serialize(v)
+        return out
+    return _humanize(obj)
+
+
+def _to_text(data) -> dict:
+    return {"content": [{"type": "text", "text": json.dumps(_serialize(data), ensure_ascii=False, indent=2)}]}
+
+
+# --------------------------------------------------------------------------
+# helper indirection so FastMCP is optional (tests can call these directly)
+# --------------------------------------------------------------------------
+if FastMCP:
+    server = FastMCP("edupage")
+else:
+    server = None
+
+
+def _tool(fn):
+    if server is not None:
+        return server.tool()(fn)
+    return fn
+
+
+def _run(fn, error_label="edupage call"):
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        return fail(f"{error_label} failed: {type(e).__name__}: {e}")
+
+
+# --------------------------------------------------------------------------
+# Login / session
+# --------------------------------------------------------------------------
+@_tool
+def login(username: str = None, password: str = None, subdomain: str = None) -> dict:
+    """Log in to Edupage for a subdomain. If username/password/subdomain are
+    omitted, env vars EDUPAGE_USERNAME, EDUPAGE_PASSWORD, EDUPAGE_SUBDOMAIN are used.
+    Multiple schools are supported: each `login` call adds/replaces that subdomain's
+    session (see `login_all`). If 2FA is enabled, returns instructions to call
+    `two_factor_check_confirmed` / `two_factor_finish`.
+    """
+    global _clients, _two_factor, _active_subdomain
+
+    def go():
+        global _clients, _two_factor, _active_subdomain
+        user = username or EDUPAGE_USERNAME
+        pwd = password or EDUPAGE_PASSWORD
+        sub = subdomain or EDUPAGE_SUBDOMAIN
+        if not (user and pwd and sub):
+            raise RuntimeError(
+                "username, password and subdomain must be provided (or set as env vars)."
+            )
+        client = Edupage()
+        tf = client.login(user, pwd, sub)
+        _clients[sub] = client
+        _two_factor[sub] = tf
+        _active_subdomain = sub
+        return {
+            "logged_in": True,
+            "username": user,
+            "subdomain": sub,
+            "user_id": client.get_user_id(),
+            "two_factor_required": tf is not None,
+        }
+
+    return _run(go, "login")
+
+
+@_tool
+def login_all(subdomains: str = None, usernames: str = None, passwords: str = None) -> dict:
+    """Log in to one or more schools using multiple subdomains in a single call.
+    Pass comma-separated values: `subdomains="school1,school2"`,
+    `usernames="u1,u2"`, `passwords="p1,p2"` (or pairs with one shared username/
+    password). Uses env vars for anything not provided."""
+    global _clients, _two_factor, _active_subdomain
+
+    def go():
+        global _clients, _two_factor, _active_subdomain
+        subs = [s.strip() for s in (subdomains or EDUPAGE_SUBDOMAIN).split(",") if s.strip()]
+        users = [u.strip() for u in (usernames or EDUPAGE_USERNAME).split(",") if u.strip()] or [EDUPAGE_USERNAME]
+        pwds = [p.strip() for p in (passwords or EDUPAGE_PASSWORD).split(",") if p.strip()] or [EDUPAGE_PASSWORD]
+        results = []
+        for i, sub in enumerate(subs):
+            user = users[i] if i < len(users) else users[-1]
+            pwd = pwds[i] if i < len(pwds) else pwds[-1]
+            if not (user and pwd):
+                results.append({"subdomain": sub, "ok": False, "error": "missing credentials"})
+                continue
+            try:
+                client = Edupage()
+                tf = client.login(user, pwd, sub)
+                _clients[sub] = client
+                _two_factor[sub] = tf
+                results.append({"subdomain": sub, "ok": True,
+                                "user_id": client.get_user_id(),
+                                "two_factor_required": tf is not None})
+            except Exception as e:  # noqa: BLE001
+                results.append({"subdomain": sub, "ok": False, "error": f"{type(e).__name__}: {e}"})
+        if _clients:
+            _active_subdomain = _clients and next(iter(_clients))
+        return {"results": results, "active_subdomain": _active_subdomain}
+
+    return _run(go, "login_all")
+
+
+@_tool
+def login_auto(username: str = None, password: str = None, subdomain: str = None) -> dict:
+    """Log in to Edupage via the portal (auto-detect school). Optionally tag the
+    resulting session with `subdomain` so multi-school tools can reference it."""
+    global _clients, _two_factor, _active_subdomain
+
+    def go():
+        global _clients, _two_factor, _active_subdomain
+        user = username or EDUPAGE_USERNAME
+        pwd = password or EDUPAGE_PASSWORD
+        if not (user and pwd):
+            raise RuntimeError("username and password must be provided (or set as env vars).")
+        client = Edupage()
+        tf = client.login_auto(user, pwd)
+        sub = subdomain or client.subdomain or "auto"
+        _clients[sub] = client
+        _two_factor[sub] = tf
+        _active_subdomain = sub
+        return {"logged_in": True, "username": user, "subdomain": sub, "user_id": client.get_user_id()}
+
+    return _run(go, "login_auto")
+
+
+@_tool
+def login_from_session(session_id: str, subdomain: str, username: str) -> dict:
+    """Create a logged-in Edupage instance from an existing PHPSESSID cookie."""
+    global _clients, _active_subdomain
+
+    def go():
+        global _clients, _active_subdomain
+        client = Edupage.from_session_id(session_id, subdomain, username)
+        _clients[subdomain] = client
+        _active_subdomain = subdomain
+        return {"logged_in": True, "username": username, "subdomain": subdomain}
+
+    return _run(go, "login_from_session")
+
+
+@_tool
+def two_factor_check_confirmed(subdomain: str = None) -> dict:
+    """After a login that required 2FA, check whether the confirmation has been
+    approved on a device. Returns True when safe to call `two_factor_finish`."""
+    def go():
+        sub = _resolve_subdomain(subdomain)
+        _require_client(sub)
+        tf = _two_factor.get(sub)
+        if tf is None:
+            raise RuntimeError(f"No pending 2FA login for '{sub}'. Call `login` first.")
+        return {"confirmed": tf.is_confirmed(), "subdomain": sub}
+
+    return _run(go, "two_factor check")
+
+
+@_tool
+def two_factor_finish(code: str = None, subdomain: str = None) -> dict:
+    """Finish 2FA authentication. If `code` is provided it is used as an email/app
+    code; otherwise the device-confirmation flow is used (call two_factor_check_confirmed first)."""
+    global _two_factor
+
+    def go():
+        global _two_factor
+        sub = _resolve_subdomain(subdomain)
+        client = _require_client(sub)
+        tf = _two_factor.get(sub)
+        if tf is None:
+            raise RuntimeError(f"No pending 2FA login for '{sub}'. Call `login` first.")
+        if code:
+            tf.finish_with_code(code)
+        else:
+            tf.finish()
+        _two_factor[sub] = None
+        return {"logged_in": True, "subdomain": sub, "user_id": client.get_user_id()}
+
+    return _run(go, "two_factor finish")
+
+
+@_tool
+def auth_status() -> dict:
+    """Show login status for all configured subdomains and the active one."""
+    sessions = {}
+    for sub, client in _clients.items():
+        sessions[sub] = client.is_logged_in
+    return {
+        "logged_in_subdomains": {s: bool(c.is_logged_in) for s, c in _clients.items()},
+        "active_subdomain": _active_subdomain,
+        "env_username_set": bool(EDUPAGE_USERNAME),
+        "env_password_set": bool(EDUPAGE_PASSWORD),
+        "env_subdomain_set": bool(EDUPAGE_SUBDOMAIN),
+    }
+
+
+@_tool
+def user_id(subdomain: str = None) -> dict:
+    """Return the logged-in user's Edupage user id."""
+    def go():
+        client = _require_client(subdomain)
+        return {"user_id": client.get_user_id(), "subdomain": _resolve_subdomain(subdomain)}
+    return _run(go, "user_id")
+
+
+@_tool
+def school_year(subdomain: str = None) -> dict:
+    """Return the current school year (starting year)."""
+    def go():
+        client = _require_client(subdomain)
+        return {"school_year": client.get_school_year(), "subdomain": _resolve_subdomain(subdomain)}
+    return _run(go, "school_year")
+
+
+# --------------------------------------------------------------------------
+# Timetables
+# --------------------------------------------------------------------------
+def _parse_date(value):
+    if value is None:
+        return date.today()
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise RuntimeError(f"Invalid date '{value}', expected YYYY-MM-DD.")
+
+
+@_tool
+def get_my_timetable(date_str: str = None, subdomain: str = None) -> dict:
+    """Get the timetable for the logged-in user for a date (YYYY-MM-DD, default today)."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        tt = client.get_my_timetable(d)
+        if tt is None:
+            return {"date": d.isoformat(), "subdomain": _resolve_subdomain(subdomain), "lessons": []}
+        return {"date": d.isoformat(), "subdomain": _resolve_subdomain(subdomain),
+                "lessons": [_serialize(ls) for ls in tt.lessons]}
+
+    return _run(go, "get_my_timetable")
+
+
+def _resolve_target(client, target_type, target_id):
+    if target_type == "teacher":
+        for t in client.get_teachers() or []:
+            if str(t.person_id) == str(target_id):
+                return t
+        raise RuntimeError(f"Teacher {target_id} not found.")
+    if target_type == "student":
+        for s in client.get_students() or []:
+            if str(s.person_id) == str(target_id):
+                return s
+        raise RuntimeError(f"Student {target_id} not found.")
+    if target_type == "class":
+        for c in client.get_classes() or []:
+            if str(c.class_id) == str(target_id):
+                return c
+        raise RuntimeError(f"Class {target_id} not found.")
+    if target_type == "classroom":
+        for c in client.get_classrooms() or []:
+            if str(c.classroom_id) == str(target_id):
+                return c
+        raise RuntimeError(f"Classroom {target_id} not found.")
+    raise RuntimeError("target_type must be teacher, student, class or classroom.")
+
+
+@_tool
+def get_timetable(target_type: str, target_id: str, date_str: str = None, subdomain: str = None) -> dict:
+    """Get the timetable for a teacher, student, class or classroom on a date.
+    target_type: 'teacher' | 'student' | 'class' | 'classroom'."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        target = _resolve_target(client, target_type, target_id)
+        tt = client.get_timetable(target, d)
+        base = {"target": f"{target_type}:{target_id}", "date": d.isoformat(),
+                "subdomain": _resolve_subdomain(subdomain)}
+        if tt is None:
+            base["lessons"] = []
+            return base
+        base["lessons"] = [_serialize(ls) for ls in tt.lessons]
+        return base
+
+    return _run(go, "get_timetable")
+
+
+@_tool
+def get_next_ringing_time(date_time_str: str = None, subdomain: str = None) -> dict:
+    """Get the type (break/lesson) and time of the next ringing for a given datetime
+    (ISO, default now)."""
+    def go():
+        client = _require_client(subdomain)
+        if date_time_str:
+            dt = datetime.fromisoformat(date_time_str)
+        else:
+            dt = datetime.now()
+        ring = client.get_next_ringing_time(dt)
+        return _serialize(ring)
+
+    return _run(go, "get_next_ringing_time")
+
+
+@_tool
+def get_next_week_timetable(subdomain: str = None) -> dict:
+    """Get the Mon-Fri timetable for next week for the logged-in user,
+    grouped by weekday."""
+    def go():
+        client = _require_client(subdomain)
+        today = date.today()
+        days_until_monday = (7 - today.weekday()) % 7
+        if days_until_monday == 0:
+            days_until_monday = 7
+        monday = today + _dt.timedelta(days=days_until_monday)
+        week = []
+        for i in range(5):
+            d = monday + _dt.timedelta(days=i)
+            tt = client.get_my_timetable(d)
+            week.append({
+                "weekday": ["Po", "Ut", "St", "Št", "Pi"][i],
+                "date": d.isoformat(),
+                "lessons": [_serialize(ls) for ls in (tt.lessons if tt else [])],
+            })
+        return {"monday": monday.isoformat(), "subdomain": _resolve_subdomain(subdomain), "week": week}
+
+    return _run(go, "get_next_week_timetable")
+
+
+@_tool
+def get_periods(subdomain: str = None) -> dict:
+    """Get the bell schedule (periods with start/end times) from the logged-in data."""
+    def go():
+        client = _require_client(subdomain)
+        if client.data is None:
+            raise RuntimeError("No login data available.")
+        zv = client.data.get("zvonenia") or []
+        return {"periods": [{"starttime": p.get("starttime"), "endtime": p.get("endtime")} for p in zv]}
+
+    return _run(go, "get_periods")
+
+
+# --------------------------------------------------------------------------
+# Grades
+# --------------------------------------------------------------------------
+@_tool
+def get_grades(year: int = None, term: str = None, subdomain: str = None) -> dict:
+    """Get grades. Optionally filter by `year` (school year start) and `term`
+    ('FIRST' or 'SECOND'). Returns list of grades (subject, teacher, percent, etc.)."""
+    def go():
+        client = _require_client(subdomain)
+        if year or term:
+            t = Term.FIRST if term == "FIRST" else Term.SECOND if term == "SECOND" else None
+            if t is None:
+                raise RuntimeError("term must be 'FIRST' or 'SECOND'.")
+            grades = client.get_grades_for_term(int(year), t)
+        else:
+            grades = client.get_grades()
+        return {"subdomain": _resolve_subdomain(subdomain), "grades": [_serialize(g) for g in grades]}
+
+    return _run(go, "get_grades")
+
+
+# --------------------------------------------------------------------------
+# Notifications / timeline (homework, exams, messages...)
+# --------------------------------------------------------------------------
+@_tool
+def get_notifications(subdomain: str = None) -> dict:
+    """Get the list of available timeline notifications (homework, tests, messages,
+    grades, events...)."""
+    def go():
+        client = _require_client(subdomain)
+        events = client.get_notifications()
+        return {"subdomain": _resolve_subdomain(subdomain), "notifications": [_serialize(e) for e in events]}
+
+    return _run(go, "get_notifications")
+
+
+@_tool
+def get_notification_history(date_from: str, subdomain: str = None) -> dict:
+    """Get timeline notifications since a date (YYYY-MM-DD), including older ones."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_from)
+        events = client.get_notification_history(d)
+        return {"subdomain": _resolve_subdomain(subdomain), "notifications": [_serialize(e) for e in events]}
+
+    return _run(go, "get_notification_history")
+
+
+@_tool
+def get_homework(subdomain: str = None) -> dict:
+    """Get homework assignments from the recent timeline notifications."""
+    def go():
+        client = _require_client(subdomain)
+        events = client.get_notifications()
+        hw = [
+            _serialize(e)
+            for e in events
+            if e.event_type in (EventType.HOMEWORK, EventType.HOMEWORK_STUDENT_STATE)
+        ]
+        return {"subdomain": _resolve_subdomain(subdomain), "homework": hw}
+
+    return _run(go, "get_homework")
+
+
+@_tool
+def get_assignments(subdomain: str = None) -> dict:
+    """Get all assignments (homework, tests, exams, projects) from the timeline."""
+    def go():
+        client = _require_client(subdomain)
+        exam_types = {
+            EventType.BIG_EXAM, EventType.HOMEWORK, EventType.ORAL_EXAM,
+            EventType.PAPER, EventType.PROJECT_EXAM, EventType.SHORT_EXAM,
+            EventType.TESTING, EventType.HOMEWORK_STUDENT_STATE,
+            EventType.EXAM_ASSIGNMENT, EventType.EXAM_EVALUATION,
+            EventType.TEST_RESULT,
+        }
+        events = client.get_notifications()
+        result = [_serialize(e) for e in events if e.event_type in exam_types]
+        return {"subdomain": _resolve_subdomain(subdomain), "assignments": result}
+
+    return _run(go, "get_assignments")
+
+
+@_tool
+def get_absences(subdomain: str = None) -> dict:
+    """Get the student's absence records from the timeline notifications."""
+    def go():
+        client = _require_client(subdomain)
+        events = client.get_notifications()
+        absence_types = {
+            EventType.STUDENT_ABSENT, EventType.EXCUSED_LESSON, EventType.REPRESENTATION,
+        }
+        result = [_serialize(e) for e in events if e.event_type in absence_types]
+        return {"subdomain": _resolve_subdomain(subdomain), "absences": result}
+
+    return _run(go, "get_absences")
+
+
+@_tool
+def get_upcoming_events(subdomain: str = None) -> dict:
+    """Get upcoming school events (trips, excursions, meetings, holidays...)."""
+    def go():
+        client = _require_client(subdomain)
+        event_types = {
+            EventType.EVENT, EventType.SCHOOL_EVENT, EventType.EXCURSION,
+            EventType.SCHOOL_TRIP, EventType.PARENTS_EVENING, EventType.TEACHER_MEETING,
+            EventType.CULTURE, EventType.SCHOOL_TEACHER_EVENT if hasattr(EventType, "SCHOOL_TEACHER_EVENT") else None,
+            EventType.FREE_DAY, EventType.HOLIDAY, EventType.SHORT_HOLIDAY,
+        }
+        event_types.discard(None)
+        events = client.get_notifications()
+        result = [_serialize(e) for e in events if e.event_type in event_types]
+        return {"subdomain": _resolve_subdomain(subdomain), "events": result}
+
+    return _run(go, "get_upcoming_events")
+
+
+@_tool
+def get_news(subdomain: str = None) -> dict:
+    """Get school news from the timeline notifications."""
+    def go():
+        client = _require_client(subdomain)
+        events = client.get_notifications()
+        result = [_serialize(e) for e in events if e.event_type == EventType.NEWS]
+        return {"subdomain": _resolve_subdomain(subdomain), "news": result}
+
+    return _run(go, "get_news")
+
+
+# --------------------------------------------------------------------------
+# Substitutions / teachers
+# --------------------------------------------------------------------------
+@_tool
+def get_timetable_changes(date_str: str = None, subdomain: str = None) -> dict:
+    """Get substitution/timetable changes for a date (default today)."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        changes = client.get_timetable_changes(d)
+        if changes is None:
+            return {"date": d.isoformat(), "subdomain": _resolve_subdomain(subdomain), "changes": []}
+        return {"date": d.isoformat(), "subdomain": _resolve_subdomain(subdomain),
+                "changes": [_serialize(c) for c in changes]}
+
+    return _run(go, "get_timetable_changes")
+
+
+@_tool
+def get_missing_teachers(date_str: str = None, subdomain: str = None) -> dict:
+    """Get teachers missing on a date (default today)."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        teachers = client.get_missing_teachers(d)
+        return {"date": d.isoformat(), "subdomain": _resolve_subdomain(subdomain),
+                "teachers": [_serialize(t) for t in teachers or []]}
+
+    return _run(go, "get_missing_teachers")
+
+
+# --------------------------------------------------------------------------
+# Meals
+# --------------------------------------------------------------------------
+@_tool
+def get_meals(date_str: str = None, subdomain: str = None) -> dict:
+    """Get the meal menu (snack/lunch/afternoon snack) for a date (default today)."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        meals = client.get_meals(d)
+        return {"date": d.isoformat(), "subdomain": _resolve_subdomain(subdomain), "meals": _serialize(meals)}
+
+    return _run(go, "get_meals")
+
+
+@_tool
+def choose_meal(date_str: str, meal_type: str, number: int, subdomain: str = None) -> dict:
+    """Order/choose a meal for a date. meal_type: 'snack'|'lunch'|'afternoon_snack'.
+    number: 1-based menu choice among the chooseable menus."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        meals = client.get_meals(d)
+        if meals is None:
+            raise RuntimeError(f"No meals available for {d.isoformat()}.")
+        meal = getattr(meals, meal_type, None)
+        if meal is None:
+            raise RuntimeError(f"No '{meal_type}' meal available for {d.isoformat()}.")
+        meal.choose(client, number)
+        return {"ordered": True, "meal_type": meal_type, "date": d.isoformat(), "number": number}
+
+    return _run(go, "choose_meal")
+
+
+@_tool
+def sign_off_meal(date_str: str, meal_type: str, subdomain: str = None) -> dict:
+    """Cancel an ordered meal for a date. meal_type: 'snack'|'lunch'|'afternoon_snack'."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        meals = client.get_meals(d)
+        meal = getattr(meals, meal_type, None) if meals else None
+        if meal is None:
+            raise RuntimeError(f"No '{meal_type}' meal available for {d.isoformat()}.")
+        meal.sign_off(client)
+        return {"ordered": False, "meal_type": meal_type, "date": d.isoformat()}
+
+    return _run(go, "sign_off_meal")
+
+
+@_tool
+def rate_meal(date_str: str, meal_type: str, quality: int, quantity: int, subdomain: str = None) -> dict:
+    """Rate a meal (1-5 quality and quantity) for a date and meal type."""
+    def go():
+        client = _require_client(subdomain)
+        d = _parse_date(date_str)
+        meals = client.get_meals(d)
+        meal = getattr(meals, meal_type, None) if meals else None
+        if meal is None:
+            raise RuntimeError(f"No '{meal_type}' meal available for {d.isoformat()}.")
+        rating_boarder = None
+        for menu in meal.menus or []:
+            if menu.rating is not None:
+                rating_boarder = menu.rating
+                break
+        if rating_boarder is None:
+            raise RuntimeError("No rating available for this meal.")
+        rating_boarder.rate(client, quantity, quality)
+        return {"rated": True, "meal_type": meal_type, "date": d.isoformat()}
+
+    return _run(go, "rate_meal")
+
+
+# --------------------------------------------------------------------------
+# Rosters
+# --------------------------------------------------------------------------
+@_tool
+def get_students(subdomain: str = None) -> dict:
+    """Get all students in the logged-in user's class."""
+    def go():
+        client = _require_client(subdomain)
+        return {"subdomain": _resolve_subdomain(subdomain),
+                "students": [_serialize(s) for s in client.get_students() or []]}
+    return _run(go, "get_students")
+
+
+@_tool
+def get_all_students(subdomain: str = None) -> dict:
+    """Get a short list of all students in the school."""
+    def go():
+        client = _require_client(subdomain)
+        return {"subdomain": _resolve_subdomain(subdomain),
+                "students": [_serialize(s) for s in client.get_all_students() or []]}
+    return _run(go, "get_all_students")
+
+
+@_tool
+def get_teachers(subdomain: str = None) -> dict:
+    """Get all teachers in the school."""
+    def go():
+        client = _require_client(subdomain)
+        return {"subdomain": _resolve_subdomain(subdomain),
+                "teachers": [_serialize(t) for t in client.get_teachers() or []]}
+    return _run(go, "get_teachers")
+
+
+@_tool
+def get_classes(subdomain: str = None) -> dict:
+    """Get all classes in the school."""
+    def go():
+        client = _require_client(subdomain)
+        return {"subdomain": _resolve_subdomain(subdomain),
+                "classes": [_serialize(c) for c in client.get_classes() or []]}
+    return _run(go, "get_classes")
+
+
+@_tool
+def get_classrooms(subdomain: str = None) -> dict:
+    """Get all classrooms in the school."""
+    def go():
+        client = _require_client(subdomain)
+        return {"subdomain": _resolve_subdomain(subdomain),
+                "classrooms": [_serialize(c) for c in client.get_classrooms() or []]}
+    return _run(go, "get_classrooms")
+
+
+@_tool
+def get_subjects(subdomain: str = None) -> dict:
+    """Get all subjects in the school."""
+    def go():
+        client = _require_client(subdomain)
+        return {"subdomain": _resolve_subdomain(subdomain),
+                "subjects": [_serialize(s) for s in client.get_subjects() or []]}
+    return _run(go, "get_subjects")
+
+
+# --------------------------------------------------------------------------
+# Messages
+# --------------------------------------------------------------------------
+@_tool
+def send_message(recipient_id: str, body: str, subdomain: str = None) -> dict:
+    """Send a message to a recipient. recipient_id is an edupage id like
+    'Student123' or 'Teacher456' (see get_students/get_teachers)."""
+    def go():
+        client = _require_client(subdomain)
+        if not body or not body.strip():
+            raise RuntimeError("body must not be empty.")
+        timeline_id = client.send_message(recipient_id, body)
+        return {"sent": True, "timeline_id": timeline_id}
+
+    return _run(go, "send_message")
+
+
+# --------------------------------------------------------------------------
+# Parent
+# --------------------------------------------------------------------------
+@_tool
+def get_my_children(subdomain: str = None) -> dict:
+    """Get the children linked to a parent account (or classmates for a student).
+    Returns students with person_id, name, class_id, number — usable with
+    switch_to_child and get_timetable."""
+    def go():
+        client = _require_client(subdomain)
+        user_id = client.get_user_id() or ""
+        if "Rodic" in user_id:
+            children = []
+            for s in client.get_all_students() or []:
+                children.append(_serialize(s))
+            return {"subdomain": _resolve_subdomain(subdomain), "children": children}
+        classmates = []
+        for s in client.get_students() or []:
+            classmates.append({
+                "person_id": s.person_id,
+                "name": s.name,
+                "class_id": getattr(s, "class_id", None),
+                "number": getattr(s, "number_in_class", None),
+            })
+        return {"subdomain": _resolve_subdomain(subdomain), "children": classmates}
+
+    return _run(go, "get_my_children")
+
+
+@_tool
+def switch_to_child(child_id: str, subdomain: str = None) -> dict:
+    """Switch to a child account (parent accounts only). child_id is the child's person_id."""
+    def go():
+        client = _require_client(subdomain)
+        client.switch_to_child(int(child_id))
+        return {"switched_to_child": int(child_id), "user_id": client.get_user_id()}
+
+    return _run(go, "switch_to_child")
+
+
+@_tool
+def switch_to_parent(subdomain: str = None) -> dict:
+    """Switch back to the parent account (parent accounts only)."""
+    def go():
+        client = _require_client(subdomain)
+        client.switch_to_parent()
+        return {"switched_to_parent": True, "user_id": client.get_user_id()}
+
+    return _run(go, "switch_to_parent")
+
+
+# --------------------------------------------------------------------------
+# Custom
+# --------------------------------------------------------------------------
+@_tool
+def custom_request(url: str, method: str, data: str = "", headers: str = "{}", subdomain: str = None) -> dict:
+    """Send a raw request to the Edupage server using the active session.
+    method: 'GET'|'POST'. Returns status code and body text."""
+    def go():
+        client = _require_client(subdomain)
+        hdrs = json.loads(headers) if headers else {}
+        resp = client.custom_request(url, method, data, hdrs)
+        return {"status_code": resp.status_code, "text": resp.text}
+
+    return _run(go, "custom_request")
+
+
+# --------------------------------------------------------------------------
+def main():
+    if server is None:
+        raise SystemExit("The 'mcp' python package is not installed.")
+    server.run()
+
+
+if __name__ == "__main__":
+    main()

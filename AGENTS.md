@@ -66,6 +66,37 @@ logic. Do not grow a scraping layer here.
 and changed the API. We target the FastMCP v1 API. Keep `mcp<2`. Bump
 `edupage-api` as needed (it can rise freely).
 
+> On shipping versions as of v0.1.0: `mcp` resolves to **1.29.1** (latest 1.x,
+> no known CVEs) and `edupage-api` to **0.12.5** (latest). Staying on `mcp<2`
+> is a deliberate **API-compat** decision, not a security pin. Revisit the v2
+> `MCPServer` port only if v1.x stops receiving security fixes or you need v2
+> features — it is a real code change, not a version bump.
+
+## Security scanning
+
+- **Dependabot** (repo-level): security alerts + automated security updates for
+  known CVEs are on by default for public repos and are enabled here.
+  `.github/dependabot.yml` adds **weekly version-update PRs** for `pip` and
+  `github-actions`. Do not remove the `ignore: mcp >=2.0.0` block (matches the
+  intentional pin).
+- **`pip-audit`** (`.github/workflows/security.yml`): scans the whole installed
+  dependency tree — direct + transitive — against OSV on every push/PR to main
+  and weekly. A run that finds a CVE **fails the workflow**; fix the pinned
+  version in `pyproject.toml` and re-verify with `pip-audit` locally before
+  releasing.
+
+Local check:
+
+```bash
+pip install pip-audit && pip-audit   # run inside the project venv
+```
+
+To run any workflow manually from `gh`:
+
+```bash
+gh workflow run security.yml --repo oliverhruby/edupage-mcp
+```
+
 ## Build / verify
 
 ```bash

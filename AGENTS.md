@@ -60,6 +60,22 @@ logic. Do not grow a scraping layer here.
   `_require_client(subdomain)` (falls back to `_active_subdomain`). Role-aware
   tools use `_roles[sub]` to determine account type and behave accordingly
   (e.g. parent → switch to student account; student → direct timetable).
+- **Student cache.** `_get_students_cached(client, subdomain)` caches visible
+  students keyed by `(subdomain, role)` for `_STUDENT_CACHE_TTL` (5 min) to avoid
+  redundant API calls across tools. Cache is cleared on `clear_student_cache`,
+  auto-login, and re-login. Parent accounts use `get_all_students()`; student/
+  teacher use `get_students()`.
+- **Tiered name matching.** `_find_student(client, name, subdomain)` matches by
+  tier (highest confidence first): full name → first name → last name → short
+  name (`name_short`, e.g. `'Novák V.'`). `_find_student_all` returns all
+  candidates with their tier/confidence; ambiguous multi-matches surface all
+  candidates to the caller rather than silently picking one.
+- **Auto-login / auto-discovery.** At startup `main()` auto-logs-in when
+  `EDUPAGE_USERNAME`+`EDUPAGE_PASSWORD` are set. If `EDUPAGE_SUBDOMAINS` is set it
+  logs into each subdomain (`_autologin`); otherwise it auto-discovers a single
+  school via the portal (`_autodiscover` → `client.login_auto`). Failures and
+  schools needing 2FA are recorded in `_autologin_failures` and surfaced by
+  `get_schools`.
 - **JSON output.** Return plain JSON serialisable via `_serialize` (handles
   dataclasses, enums, `datetime`). Don't return raw `edupage-api` objects.
 

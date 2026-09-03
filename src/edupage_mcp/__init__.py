@@ -4,7 +4,8 @@ Exposes the full feature set of the `edupage-api` Python library as MCP tools:
 login (standard, auto, session-id, 2FA), timetables, school year, ringing,
 grades, notifications/history (homework, exams...), substitutions, missing
 teachers, meals (+ ordering), rosters (students/teachers/classes/classrooms/
-subjects), messages, parent child-switching, and custom requests.
+subjects), messages, role-aware student switching, multi-school auto-discovery,
+and custom requests.
 
 Careful: login/send_message/switch_to_student/meal actions mutate Edupage state.
 All `get_*` tools are read-only.
@@ -40,9 +41,8 @@ except Exception:
 
 EDUPAGE_USERNAME = os.environ.get("EDUPAGE_USERNAME", "")
 EDUPAGE_PASSWORD = os.environ.get("EDUPAGE_PASSWORD", "")
-EDUPAGE_SUBDOMAIN = os.environ.get("EDUPAGE_SUBDOMAIN", "")
 # Comma-separated list of schools to auto-login on startup (multi-school + automatic
-# child discovery across all of them). Supersedes EDUPAGE_SUBDOMAIN for auto-login.
+# student discovery across all of them).
 EDUPAGE_SUBDOMAINS = os.environ.get("EDUPAGE_SUBDOMAINS", "")
 
 # Multiple-school support: one Edupage() session per subdomain.
@@ -50,6 +50,14 @@ _clients = {}          # subdomain -> Edupage
 _two_factor = {}       # subdomain -> TwoFactorLogin
 _active_subdomain = None
 _roles = {}            # subdomain -> "student" | "parent" | "teacher"
+
+# Student data cache to avoid redundant API calls across tools.
+# Keyed by (subdomain, role) -> {"students": [...], "timestamp": float}
+_student_cache = {}
+_STUDENT_CACHE_TTL = 300  # 5 minutes
+
+# Track auto-login failures (2FA, network, etc.) per subdomain.
+_autologin_failures = {}  # subdomain -> error message
 
 
 def fail(message: str) -> dict:
@@ -81,6 +89,23 @@ def _resolve_role(client):
     if "Teacher" in uid:
         return "teacher"
     return "student"
+
+
+def _get_students_cached(client, subdomain):
+    """Get students for a school, using cache to avoid redundant API calls.
+    Returns list of student-like objects with .person_id, .name, .class_id."""
+    role = _roles.get(subdomain, "student")
+    cache_key = (subdomain, role)
+    now = time.time()
+    cached = _student_cache.get(cache_key)
+    if cached and (now - cached["timestamp"]) < _STUDENT_CACHE_TTL:
+        return cached["students"]
+    if role == "parent":
+        students = client.get_all_students() or []
+    else:
+        students = client.get_students() or []
+    _student_cache[cache_key] = {"students": students, "timestamp": now}
+    return students
 
 
 def _humanize(value):
@@ -154,7 +179,7 @@ def _run(fn, error_label="edupage call"):
 @_tool
 def login(username: str = None, password: str = None, subdomain: str = None) -> dict:
     """Log in to Edupage for a subdomain. If username/password/subdomain are
-    omitted, env vars EDUPAGE_USERNAME, EDUPAGE_PASSWORD, EDUPAGE_SUBDOMAIN are used.
+    omitted, env vars EDUPAGE_USERNAME, EDUPAGE_PASSWORD, EDUPAGE_SUBDOMAINS are used.
     Multiple schools are supported: each `login` call adds/replaces that subdomain's
     session (see `login_all`). If 2FA is enabled, returns instructions to call
     `two_factor_check_confirmed` / `two_factor_finish`.
@@ -198,7 +223,7 @@ def login_all(subdomains: str = None, usernames: str = None, passwords: str = No
 
     def go():
         global _clients, _two_factor, _active_subdomain, _roles
-        subs = [s.strip() for s in (subdomains or EDUPAGE_SUBDOMAIN).split(",") if s.strip()]
+        subs = [s.strip() for s in (subdomains or EDUPAGE_SUBDOMAINS).split(",") if s.strip()]
         users = [u.strip() for u in (usernames or EDUPAGE_USERNAME).split(",") if u.strip()] or [EDUPAGE_USERNAME]
         pwds = [p.strip() for p in (passwords or EDUPAGE_PASSWORD).split(",") if p.strip()] or [EDUPAGE_PASSWORD]
         results = []
@@ -320,7 +345,7 @@ def auth_status() -> dict:
         "active_subdomain": _active_subdomain,
         "env_username_set": bool(EDUPAGE_USERNAME),
         "env_password_set": bool(EDUPAGE_PASSWORD),
-        "env_subdomain_set": bool(EDUPAGE_SUBDOMAIN),
+        "env_subdomains_set": bool(EDUPAGE_SUBDOMAINS),
     }
 
 
@@ -393,37 +418,112 @@ def _resolve_target(client, target_type, target_id):
     raise RuntimeError("target_type must be teacher, student, class or classroom.")
 
 
-def _find_student(client, name: str):
-    """Find a student by first/last/full name (case-insensitive) within a school."""
+def _find_student(client, name: str, subdomain=None):
+    """Find a student by name within a school using tiered matching.
+
+    Matching tiers (highest confidence first):
+      1. Exact full name match (case-insensitive)
+      2. First name match (needle is a single word matching a first name)
+      3. Last name match (needle matches a last name)
+      4. Short name match for parent accounts (e.g. 'Novak V.' matches 'Viktor Novak')
+
+    Returns the best single match. Raises RuntimeError if 0 or >1 matches at the
+    highest populated tier."""
+    matches = _find_student_all(client, name, subdomain)
+    if not matches:
+        raise RuntimeError(f"No student named '{name}' found in this school.")
+    if len(matches) == 1:
+        return matches[0]["_raw"]
+    # Multiple matches — find the highest-confidence tier among them
+    best_tier = min(m["tier"] for m in matches)
+    best = [m for m in matches if m["tier"] == best_tier]
+    if len(best) == 1:
+        return best[0]["_raw"]
+    names = ", ".join(m["name"] for m in best)
+    raise RuntimeError(
+        f"Ambiguous: {len(best)} students match '{name}' in this school: {names}. "
+        "Provide a more specific name or use student_id."
+    )
+
+
+def _find_student_all(client, name, subdomain=None):
+    """Search for students matching `name` across all tiers. Returns list of
+    dicts with keys: name, student_id, class_id, subdomain, tier, confidence, _raw."""
     needle = str(name).strip().lower()
     if not needle:
-        raise RuntimeError("name must be provided.")
-    candidates = []
-    for s in (client.get_all_students() or []) + (client.get_students() or []):
+        return []
+    sub = subdomain or ""
+    students = _get_students_cached(client, sub)
+    results = []
+    for s in students:
         sname = getattr(s, "name", "") or ""
-        parts = [p.strip().lower() for p in sname.split(",") if p.strip()]
-        names = parts + sname.split()
-        match = any(p == needle for p in names) or (needle in sname.lower())
-        if match:
-            candidates.append(s)
-    if not candidates:
-        raise RuntimeError(f"No student named '{name}' found in this school.")
-    return candidates[0]
+        # Build name parts: try full name, comma-separated, space-separated
+        full_lower = sname.strip().lower()
+        parts = [p.strip().lower() for p in sname.replace(",", " ").split() if p.strip()]
+        # Also try the short name field if present (parent accounts)
+        short = getattr(s, "name_short", None) or ""
+        short_lower = short.strip().lower()
+        short_parts = [p.strip().lower() for p in short.replace(",", " ").split() if p.strip()]
+
+        tier = None
+        confidence = 0.0
+
+        # Tier 1: Exact full name match
+        if needle == full_lower:
+            tier = 1
+            confidence = 1.0
+        # Tier 1b: Exact short name match
+        elif short_lower and needle == short_lower:
+            tier = 1
+            confidence = 0.95
+        # Tier 2: First name match (needle is a single word)
+        elif len(parts) >= 2 and needle == parts[0]:
+            tier = 2
+            confidence = 0.85
+        elif short_parts and len(short_parts) >= 2 and needle == short_parts[0]:
+            tier = 2
+            confidence = 0.80
+        # Tier 3: Last name match
+        elif len(parts) >= 2 and needle == parts[-1]:
+            tier = 3
+            confidence = 0.70
+        elif short_parts and len(short_parts) >= 2 and needle == short_parts[-1]:
+            tier = 3
+            confidence = 0.65
+        # Tier 4: Substring match (last resort, lower confidence)
+        elif needle in full_lower or (short_lower and needle in short_lower):
+            tier = 4
+            confidence = 0.40
+
+        if tier is not None:
+            results.append({
+                "name": sname,
+                "student_id": s.person_id,
+                "class_id": getattr(s, "class_id", None),
+                "subdomain": sub,
+                "tier": tier,
+                "confidence": confidence,
+                "_raw": s,
+            })
+    # Sort by tier (best first), then confidence
+    results.sort(key=lambda r: (r["tier"], -r["confidence"]))
+    return results
 
 
 def _student_timetable_at(client, sub, name, student_id, d):
     """Resolve a student (by name or id) within one school and return their timetable.
     Returns None when the student is not found at this school. Role-aware: if the
-    caller is a parent, temporarily switches to the student account."""
+    caller is a parent, temporarily switches to the student account. Uses cache."""
     if student_id and not name:
         sid = str(student_id)
-        match = next((s for s in (client.get_all_students() or []) + (client.get_students() or [])
+        students = _get_students_cached(client, sub)
+        match = next((s for s in students
                       if str(getattr(s, "person_id", "")) == sid), None)
         if match is None:
             return None
         name = match.name
     try:
-        student = _find_student(client, name)
+        student = _find_student(client, name, sub)
     except RuntimeError:
         return None
     sid = int(student.person_id)
@@ -871,25 +971,28 @@ def send_message(recipient_id: str, body: str, subdomain: str = None) -> dict:
 @_tool
 def get_my_students(subdomain: str = None) -> dict:
     """Get students visible to the logged-in account: parent accounts see all
-    students in the school; student accounts see classmates. Returns person_id,
-    name, class_id — usable with switch_to_student and get_student_timetable."""
+    students in the school; student accounts see classmates. Uses cached data.
+    Returns person_id, name, class_id — usable with switch_to_student and
+    get_student_timetable."""
     def go():
         client = _require_client(subdomain)
-        role = _roles.get(_resolve_subdomain(subdomain), "student")
+        sub = _resolve_subdomain(subdomain)
+        role = _roles.get(sub, "student")
+        students = _get_students_cached(client, sub)
         if role == "parent":
-            students = []
-            for s in client.get_all_students() or []:
-                students.append(_serialize(s))
-            return {"subdomain": _resolve_subdomain(subdomain), "students": students}
+            serialized = []
+            for s in students:
+                serialized.append(_serialize(s))
+            return {"subdomain": sub, "students": serialized}
         classmates = []
-        for s in client.get_students() or []:
+        for s in students:
             classmates.append({
                 "person_id": s.person_id,
                 "name": s.name,
                 "class_id": getattr(s, "class_id", None),
                 "number": getattr(s, "number_in_class", None),
             })
-        return {"subdomain": _resolve_subdomain(subdomain), "students": classmates}
+        return {"subdomain": sub, "students": classmates}
 
     return _run(go, "get_my_students")
 
@@ -900,9 +1003,10 @@ def switch_to_student(student_id: str = None, name: str = None, subdomain: str =
     or `name` (first/last/full name)."""
     def go():
         client = _require_client(subdomain)
+        sub = _resolve_subdomain(subdomain)
         if not student_id and not name:
             raise RuntimeError("Provide `student_id` or `name`.")
-        cid = int(student_id) if student_id else int(_find_student(client, name).person_id)
+        cid = int(student_id) if student_id else int(_find_student(client, name, sub).person_id)
         client.switch_to_child(cid)
         return {"switched_to_student": cid, "user_id": client.get_user_id()}
 
@@ -911,37 +1015,46 @@ def switch_to_student(student_id: str = None, name: str = None, subdomain: str =
 
 @_tool
 def find_student(name: str, subdomain: str = None) -> dict:
-    """Look up a student's person_id by first/last name.
+    """Look up a student by first/last/full name using tiered matching.
     Without a `subdomain`, searches ALL logged-in schools and returns one result per
-    school where the student is found. Returns student info usable with
-    get_student_timetable."""
+    school where the student is found. Returns student info with match confidence
+    tiers (1=exact, 2=first name, 3=last name, 4=substring). Use student_id from
+    results with get_student_timetable for unambiguous lookups."""
     def go():
         if not name:
             raise RuntimeError("Provide `name` for the student to find.")
         if subdomain:
             client = _require_client(subdomain)
-            student = _find_student(client, name)
-            return {"results": [{"name": student.name, "student_id": student.person_id,
-                    "class_id": getattr(student, "class_id", None),
-                    "subdomain": _resolve_subdomain(subdomain)}]}
+            matches = _find_student_all(client, name, _resolve_subdomain(subdomain))
+            if not matches:
+                raise RuntimeError(f"No student named '{name}' found at '{subdomain}'.")
+            return {"results": [{"name": m["name"], "student_id": m["student_id"],
+                    "class_id": m["class_id"], "subdomain": m["subdomain"],
+                    "tier": m["tier"], "confidence": m["confidence"]}
+                    for m in matches],
+                    "query": name, "subdomain": _resolve_subdomain(subdomain)}
         schools = list(_clients.keys())
         if not schools:
             raise RuntimeError("Not logged in to any school. Set EDUPAGE_SUBDOMAINS (or call `login_all`) first.")
-        results = []
+        all_results = []
         for sub in schools:
             client = _clients[sub]
             if client is None or not client.is_logged_in:
                 continue
-            try:
-                student = _find_student(client, name)
-                results.append({"name": student.name, "student_id": student.person_id,
-                               "class_id": getattr(student, "class_id", None),
-                               "subdomain": sub})
-            except RuntimeError:
-                continue
-        if not results:
+            matches = _find_student_all(client, name, sub)
+            for m in matches:
+                all_results.append({
+                    "name": m["name"], "student_id": m["student_id"],
+                    "class_id": m["class_id"], "subdomain": m["subdomain"],
+                    "tier": m["tier"], "confidence": m["confidence"],
+                })
+        if not all_results:
             raise RuntimeError(f"No student named '{name}' found in any logged-in school {schools}.")
-        return {"results": results, "query": name, "matched_schools": len(results)}
+        # Sort by tier (best first) across all schools
+        all_results.sort(key=lambda r: (r["tier"], -r["confidence"]))
+        return {"results": all_results, "query": name,
+                "matched_schools": len(set(r["subdomain"] for r in all_results)),
+                "total_matches": len(all_results)}
 
     return _run(go, "find_student")
 
@@ -949,21 +1062,47 @@ def find_student(name: str, subdomain: str = None) -> dict:
 @_tool
 def get_schools() -> dict:
     """List all schools the server is logged into (from auto-discovery or login_all).
-    Returns each subdomain with its login state, role (student/parent/teacher) and user id."""
+    Returns each subdomain with its login state, role (student/parent/teacher),
+    2FA pending status, and user id."""
     def go():
         schools = []
         for sub in _clients:
             client = _clients[sub]
+            tf_pending = _two_factor.get(sub) is not None
             schools.append({
                 "subdomain": sub,
                 "logged_in": bool(client and client.is_logged_in),
                 "role": _roles.get(sub),
                 "user_id": client.get_user_id() if (client and client.is_logged_in) else None,
+                "two_factor_pending": tf_pending,
                 "active": sub == _active_subdomain,
             })
-        return {"schools": schools, "active_subdomain": _active_subdomain}
+        failed = dict(_autologin_failures) if _autologin_failures else {}
+        return {"schools": schools, "active_subdomain": _active_subdomain,
+                "failed_logins": failed}
 
     return _run(go, "get_schools")
+
+
+@_tool
+def clear_student_cache(subdomain: str = None) -> dict:
+    """Force refresh of cached student data. Call this after students are added/removed
+    from a school, or if scan_students/find_student returns stale results.
+    Without a subdomain, clears the cache for ALL schools."""
+    def go():
+        global _student_cache
+        if subdomain:
+            cleared = []
+            for key in list(_student_cache.keys()):
+                if key[0] == subdomain:
+                    del _student_cache[key]
+                    cleared.append(key)
+            return {"cleared": [subdomain], "entries_removed": len(cleared)}
+        count = len(_student_cache)
+        _student_cache = {}
+        return {"cleared": "all", "entries_removed": count}
+
+    return _run(go, "clear_student_cache")
 
 
 @_tool
@@ -972,18 +1111,23 @@ def scan_students() -> dict:
     For a parent account: all students in each school. For a student account:
     classmates in each school. Returns one entry per student per school, so a
     multi-school student (e.g. Tamara at iprskola + cvcmalacky) appears with
-    separate per-school records."""
+    separate per-school records. Uses cached data to avoid redundant API calls."""
     def go():
         if not _clients:
             raise RuntimeError("Not logged in to any school. Set EDUPAGE_SUBDOMAINS (or call `login_all`) first.")
         discovered = []
+        seen = set()
         for sub in _clients:
             client = _clients[sub]
             if not (client and client.is_logged_in):
                 continue
             try:
-                students = _visible_students(client)
+                students = _visible_students(client, sub)
                 for student in students:
+                    key = (student.person_id, sub)
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     discovered.append({
                         "name": student.name,
                         "student_id": student.person_id,
@@ -992,18 +1136,16 @@ def scan_students() -> dict:
                     })
             except Exception as e:  # noqa: BLE001
                 discovered.append({"subdomain": sub, "error": f"{type(e).__name__}: {e}"})
-        return {"students": discovered, "scanned": True}
+        return {"students": discovered, "scanned": True, "total": len(discovered)}
 
     return _run(go, "scan_students")
 
 
-def _visible_students(client):
+def _visible_students(client, subdomain=None):
     """Students visible to the logged-in account: all students in school (parent),
-    classmates (student/teacher)."""
-    role = _roles.get(client.subdomain if hasattr(client, 'subdomain') else "", "student")
-    if role == "parent":
-        return client.get_all_students() or []
-    return client.get_students() or []
+    classmates (student/teacher). Uses cache to avoid redundant API calls."""
+    sub = subdomain or ""
+    return _get_students_cached(client, sub)
 
 
 @_tool
@@ -1037,16 +1179,42 @@ def custom_request(url: str, method: str, data: str = "", headers: str = "{}", s
 def main():
     if server is None:
         raise SystemExit("The 'mcp' python package is not installed.")
-    if EDUPAGE_SUBDOMAINS and not _clients:
-        subs = [s.strip() for s in EDUPAGE_SUBDOMAINS.split(",") if s.strip()]
-        if subs and EDUPAGE_USERNAME and EDUPAGE_PASSWORD:
-            _autologin(subs)
+    if not _clients and EDUPAGE_USERNAME and EDUPAGE_PASSWORD:
+        if EDUPAGE_SUBDOMAINS:
+            subs = [s.strip() for s in EDUPAGE_SUBDOMAINS.split(",") if s.strip()]
+            if subs:
+                _autologin(subs)
+        else:
+            _autodiscover()
     server.run()
 
 
+def _autodiscover():
+    """Auto-discover a single school via login_auto when EDUPAGE_SUBDOMAINS is empty."""
+    global _clients, _two_factor, _active_subdomain, _roles, _autologin_failures, _student_cache
+    _autologin_failures = {}
+    _student_cache = {}
+    try:
+        client = Edupage()
+        tf = client.login_auto(EDUPAGE_USERNAME, EDUPAGE_PASSWORD)
+        sub = client.subdomain or "auto"
+        _clients[sub] = client
+        _two_factor[sub] = tf
+        _roles[sub] = _resolve_role(client)
+        _active_subdomain = sub
+        if tf is not None:
+            _autologin_failures[sub] = "2FA required — call two_factor_check_confirmed / two_factor_finish"
+    except Exception as e:  # noqa: BLE001
+        _autologin_failures["portal"] = f"{type(e).__name__}: {e}"
+
+
 def _autologin(subs):
-    """Login to every school in `subs` with the shared EDUPAGE_USERNAME/PASSWORD."""
-    global _clients, _two_factor, _active_subdomain, _roles
+    """Login to every school in `subs` with the shared EDUPAGE_USERNAME/PASSWORD.
+    Tracks 2FA-pending and failed schools in _autologin_failures."""
+    global _clients, _two_factor, _active_subdomain, _roles, _autologin_failures, _student_cache
+    _autologin_failures = {}
+    # Clear student cache since we're establishing fresh sessions
+    _student_cache = {}
     for sub in subs:
         try:
             client = Edupage()
@@ -1054,8 +1222,10 @@ def _autologin(subs):
             _clients[sub] = client
             _two_factor[sub] = tf
             _roles[sub] = _resolve_role(client)
-        except Exception:  # noqa: BLE001
-            pass
+            if tf is not None:
+                _autologin_failures[sub] = "2FA required — call two_factor_check_confirmed / two_factor_finish"
+        except Exception as e:  # noqa: BLE001
+            _autologin_failures[sub] = f"{type(e).__name__}: {e}"
     if _clients:
         _active_subdomain = next(iter(_clients))
 

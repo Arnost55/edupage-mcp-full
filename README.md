@@ -176,19 +176,19 @@ Either set environment variables **or** pass credentials to `login` (see
 # Windows (persistent, per-user)
 setx EDUPAGE_USERNAME "your_username"
 setx EDUPAGE_PASSWORD "your_password"
-setx EDUPAGE_SUBDOMAIN "your_school"     # single school: https://your_school.edupage.org
-setx EDUPAGE_SUBDOMAINS "s1,s2,s3"       # multiple schools: auto-login + child discovery
+setx EDUPAGE_SUBDOMAINS "s1,s2,s3"       # optional: multiple schools (auto-login + discovery)
 
 # macOS / Linux
 export EDUPAGE_USERNAME="your_username"
 export EDUPAGE_PASSWORD="your_password"
-export EDUPAGE_SUBDOMAIN="your_school"
-export EDUPAGE_SUBDOMAINS="s1,s2,s3"
+export EDUPAGE_SUBDOMAINS="s1,s2,s3"     # optional
 ```
 
-`EDUPAGE_SUBDOMAIN` is the single-subdomain case; for **multiple schools** use
-`EDUPAGE_SUBDOMAINS` (auto-login on startup + automatic child discovery). See
-[Multiple schools & automatic child discovery](#multiple-schools--automatic-child-discovery).
+**Single school?** Just set `EDUPAGE_USERNAME` + `EDUPAGE_PASSWORD`. The server
+auto-discovers your school via the EduPage portal on startup — no subdomain needed.
+
+**Multiple schools?** Add `EDUPAGE_SUBDOMAINS` (comma-separated). The server
+logs into all of them on startup with your shared credentials.
 
 ### 3. Register with your MCP client
 
@@ -204,7 +204,7 @@ export EDUPAGE_SUBDOMAINS="s1,s2,s3"
       "env": {
         "EDUPAGE_USERNAME": "{env:EDUPAGE_USERNAME}",
         "EDUPAGE_PASSWORD": "{env:EDUPAGE_PASSWORD}",
-        "EDUPAGE_SUBDOMAIN": "{env:EDUPAGE_SUBDOMAIN}"
+        "EDUPAGE_SUBDOMAINS": "{env:EDUPAGE_SUBDOMAINS}"
       }
     }
   }
@@ -314,9 +314,9 @@ auth_status          # shows all logged-in subdomains + which is active
 
 You can also call `login` once per school to add/lookup sessions incrementally.
 
-> `EDUPAGE_SUBDOMAIN` (singular) env var covers a single school only. For two or
-> more schools use `EDUPAGE_SUBDOMAINS` (auto-login) or `login_all` / repeated
-> `login` calls.
+> **Single school?** No `EDUPAGE_SUBDOMAINS` needed — the server auto-discovers
+> your school via the portal on startup. For two or more schools, set
+> `EDUPAGE_SUBDOMAINS` (auto-login) or use `login_all` / repeated `login` calls.
 
 ---
 

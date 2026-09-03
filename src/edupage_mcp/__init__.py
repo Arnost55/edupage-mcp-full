@@ -1194,12 +1194,19 @@ def main():
                 _autologin(subs)
         else:
             _autodiscover()
-    transport = MCP_TRANSPORT
+    transport = MCP_TRANSPORT.strip().lower()
+    if transport not in ("stdio", "sse", "streamable-http"):
+        sys.stderr.write(
+            f"Error: unsupported MCP_TRANSPORT={MCP_TRANSPORT!r}. Use stdio, sse, or streamable-http.\n"
+        )
+        sys.exit(1)
     if transport in ("sse", "streamable-http"):
         if MCP_HOST == "0.0.0.0" and not MCP_API_KEY:
-            sys.stderr.write("Error: MCP_API_KEY must be set when binding to 0.0.0.0 for HTTP transport.\n")
+            sys.stderr.write(
+                "Error: MCP_API_KEY must be set when binding to 0.0.0.0 for HTTP transport.\n"
+            )
             sys.exit(1)
-    server.run(transport=transport)
+    server.run(transport=transport, host=MCP_HOST, port=MCP_PORT)
 
 
 def _autodiscover():

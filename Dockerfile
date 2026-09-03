@@ -8,17 +8,12 @@ WORKDIR /app
 RUN adduser --disabled-password --gecos '' appuser
 EXPOSE 8000
 
-# Copy dependency definitions
-COPY pyproject.toml .
-COPY requirements.txt .
+# Copy project files needed for installation
+COPY pyproject.toml requirements.txt README.md LICENSE ./
+COPY src/ ./src/
 
 # Install dependencies
 RUN pip install --no-cache-dir -e .
-
-# Copy the rest of the application
-COPY src/ ./src/
-COPY README.md .
-COPY LICENSE .
 
 # Change to non-root user
 USER appuser
